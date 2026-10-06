@@ -139,6 +139,9 @@ class SessionState:
     history: List[Dict[str, Any]] = field(default_factory=list)
     cancel_event: Any = None  # threading.Event
     is_running: bool = False
+    background_completions: list[tuple[str, str]] = field(default_factory=list)
+    background_completion_ids: set[str] = field(default_factory=set)
+    active_turn_kind: str = ""
     # A state-mutating slash command (/reset, /compress, /model) is in flight. Turn claims
     # must queue behind it: /compress's LLM call and /model's agent rebuild take seconds, so
     # a bare is_running check in the slash thread would leave a check-then-act window where
@@ -181,6 +184,10 @@ class SessionManager:
         state = self._install_state(session_id, agent, cwd, getattr(agent, "model", "") or "", [])
         logger.info("Created ACP session %s (cwd=%s)", session_id, cwd)
         return state
+
+    def get_memory_session(self, session_id: str) -> Optional[SessionState]:
+        with self._lock:
+            return self._sessions.get(session_id)
 
     def get_session(self, session_id: str) -> Optional[SessionState]:
         """Return the session, transparently restoring it from the DB (e.g. after
@@ -576,6 +583,16 @@ class SessionManager:
             if resolve_error is not None:
                 raise resolve_error from exc
             raise
+
+        display_cfg = config.get("display") or {}
+        mem_notif = display_cfg.get("memory_notifications")
+        if isinstance(mem_notif, bool):
+            mem_notif = "on" if mem_notif else "off"
+        mem_notif = str(mem_notif).lower() if mem_notif else "on"
+        if mem_notif not in {"off", "on", "verbose"}:
+            mem_notif = "on"
+        agent.memory_notifications = mem_notif
+
         # ACP stdio: stdout is protocol-only JSON-RPC; agent chatter goes to stderr.
         agent._print_fn = _acp_stderr_print
         return agent

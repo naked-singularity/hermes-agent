@@ -130,6 +130,9 @@ def _history_replay_updates(history: list[dict[str, Any]]):
     for message in history:
         role = str(message.get("role") or "")
         if role == "user":
+            if message.get("display_kind") == "internal_notification" and (message.get("display_metadata") or {}).get("source") == "acp_background_completion":
+                # Maintain turn alternation in context, but hide synthetic background-completion rows from the UI.
+                continue
             if (chunk := _history_message_chunk(role, message)) is not None:
                 yield chunk
         elif role == "assistant":
@@ -255,13 +258,116 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._connected_session_ids: set[str] = set()
+        self._background_notification_task: asyncio.Task | None = None
 
     # ---- Connection lifecycle -----------------------------------------------
 
     def on_connect(self, conn: acp.Client) -> None:
         """Store the client connection for sending session updates."""
         self._conn = conn
+        self._connected_session_ids.clear()
+        self._ensure_background_notification_task()
         logger.info("ACP client connected")
+
+    def _ensure_background_notification_task(self) -> None:
+        if self._background_notification_task is not None and not self._background_notification_task.done():
+            self._background_notification_task.cancel()
+        self._background_notification_task = asyncio.create_task(self._background_notification_loop())
+
+    async def _background_notification_loop(self) -> None:
+        while True:
+            try:
+                await asyncio.sleep(0.25)
+                await self._dispatch_background_notifications_once()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.debug("Background tick failed", exc_info=True)
+
+    async def _dispatch_background_notifications_once(self) -> None:
+        try:
+            from tools.process_registry import process_registry
+        except ImportError:
+            return
+
+        conn = self._conn
+        if conn is None:
+            return
+
+        events = process_registry.drain_notifications(
+            owns_event=lambda e: str(e.get("session_key") or "") in self._connected_session_ids,
+            skip_poll_observed=False,
+        )
+        if not events:
+            return
+
+        affected_sessions = set()
+        failed_idx = None
+        for i, event in enumerate(events):
+            if self._conn is not conn:
+                failed_idx = i
+                break
+            acp_session_id = str(event.get("session_key") or "")
+            process_id = str(event.get("session_id") or "")
+            event_type = str(event.get("type") or "completion")
+
+            if event_type == "completion":
+                state = self.session_manager.get_memory_session(acp_session_id)
+                if state is None:
+                    # Ignore and requeue
+                    self._connected_session_ids.discard(acp_session_id)
+                    failed_idx = i
+                    break
+
+                with state.runtime_lock:
+                    if process_id in state.background_completion_ids:
+                        continue
+
+                status = event.get("completion_status") or "completed"
+                exit_code = event.get("exit_code")
+                proc_info = {
+                    "id": process_id, "event": "completion", "status": status,
+                }
+                if exit_code is not None:
+                    proc_info["exitCode"] = exit_code
+                update = AgentMessageChunk(
+                    session_update="agent_message_chunk",
+                    content=TextContentBlock(
+                        type="text",
+                        text=f"⚙️ Background process {process_id} completed",
+                    ),
+                    field_meta={"hermes": {"backgroundNotification": True, "process": proc_info}}
+                )
+                try:
+                    await conn.session_update(acp_session_id, update)
+                except Exception:
+                    failed_idx = i
+                    break
+                with state.runtime_lock:
+                    state.background_completion_ids.add(process_id)
+                    text_str = str(event.get("text") or "").strip() or f"Process {process_id} {status}"
+                    state.background_completions.append((process_id, text_str))
+                affected_sessions.add(acp_session_id)
+
+        if failed_idx is not None and failed_idx < len(events):
+            undelivered = events[failed_idx:]
+            for e in reversed(undelivered):
+                process_registry.completion_queue.appendleft(e)
+
+            if self._conn is conn:
+                # Same connection but transport threw error, likely stale. Close.
+                logger.debug("ACP notification delivery failed, reconnecting.")
+                self._conn = None
+
+        for sid in affected_sessions:
+            try:
+                state = self.session_manager.get_memory_session(sid)
+                if state:
+                    await self._drain_background_completions(state, sid, conn)
+            except Exception:
+                logger.debug("Failed to drain background completions", exc_info=True)
+
 
     async def _send(self, session_id: str, update: Any, *, fail_msg: str, level: int = logging.WARNING) -> bool:
         """``session_update`` that logs instead of raising; False on failure."""
@@ -602,6 +708,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 )
         self._schedule_available_commands_update(state.session_id)
         self._schedule_soon(lambda: self._send_usage_update(state))
+        self._connected_session_ids.add(state.session_id)
+        conn = self._conn
+        self._schedule_soon(lambda: self._drain_background_completions(state, state.session_id, conn))
         return {
             "models": self._build_model_state(state),
             "modes": self._session_modes(state),
@@ -618,6 +727,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # blocking; inline it froze the loop serving every JSON-RPC request (#58083).
         state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
         await self._attach_session_mcp(state, mcp_servers, "New session %s (cwd=%s)", state.session_id, cwd)
+        self._connected_session_ids.add(state.session_id)
         return NewSessionResponse(session_id=state.session_id, **await self._session_response_fields(state))
 
     async def load_session(
@@ -647,7 +757,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if not (state and state.cancel_event):
             return
         with state.runtime_lock:
-            if state.is_running and state.current_prompt_text:
+            state.background_completions.clear()
+            if state.is_running and state.active_turn_kind == "user" and state.current_prompt_text:
                 state.interrupted_prompt_text = state.current_prompt_text
             # Cancel + hard-stop under the lock so no other prompt mistakes this turn for
             # redirectable work.
@@ -738,9 +849,10 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if not state.is_running and not state.command_op:
                 state.is_running = True
                 state.current_prompt_text = user_text or "[Image attachment]"
+                state.active_turn_kind = "user"
                 return None
             # Redirect steers a live turn; a state-mutating command (command_op) has none.
-            if state.is_running and text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
+            if state.is_running and state.active_turn_kind == "user" and text_only and isinstance(user_content, str) and hasattr(state.agent, "redirect") and (
                 getattr(state.agent, "_supports_active_turn_redirect", False) is True
             ):
                 try:
@@ -754,6 +866,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
     def _run_agent_turn(
         self, *, state: SessionState, session_id: str, user_text: str, user_content: Any, conn: Any,
         loop: asyncio.AbstractEventLoop, approval_cb: Any, edit_approval_requester: Any,
+        persist_user_display_kind: str | None = None, persist_user_display_metadata: dict[str, Any] | None = None,
     ) -> dict:
         """Executor-thread body of one turn, run inside ``contextvars.copy_context()`` so
         ContextVar writes are isolated from concurrent sessions.
@@ -810,6 +923,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 return agent.run_conversation(
                     user_message=user_content, conversation_history=state.history, task_id=session_id,
                     persist_user_message=user_text or "[Image attachment]",
+                    persist_user_display_kind=persist_user_display_kind,
+                    persist_user_display_metadata=persist_user_display_metadata,
                 )
             except Exception as e:
                 logger.exception("Agent error in session %s", session_id)
@@ -830,6 +945,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
 
         user_text, user_content = self._rewrite_prompt_for_interrupt(state, user_text, user_content, text_only_prompt)
 
+        self._wire_background_review_callback(state, session_id, self._conn, asyncio.get_running_loop())
         # Slash commands are text-only; a prompt with media goes to the agent even if it starts with "/".
         if text_only_prompt and isinstance(user_content, str) and user_text.startswith("/"):
             # Off the loop: /model validates through switch_model (network I/O) and /compress
@@ -840,7 +956,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                     await self._conn.session_update(session_id, acp.update_agent_message_text(response_text))
                     await self._send_usage_update(state)
                 # A mutating command held command_op; prompts that arrived mid-op are queued.
-                await self._drain_queued_prompts(state, session_id, self._conn)
+                await self._drain_pending_work(state, session_id, self._conn)
                 return PromptResponse(stop_reason="end_turn")
 
         absorbed = self._claim_turn_or_queue(state, session_id, user_text, user_content, text_only_prompt)
@@ -850,7 +966,21 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             return PromptResponse(stop_reason="end_turn")
 
         logger.info("Prompt on session %s: %s", session_id, user_text[:100])
-        conn, loop = self._conn, asyncio.get_running_loop()
+        conn = self._conn
+        return await self._execute_claimed_turn(state, session_id, user_text, user_content, conn)
+
+    async def _execute_claimed_turn(
+        self,
+        state: SessionState,
+        session_id: str,
+        user_text: str,
+        user_content: Any,
+        conn: Any,
+        *,
+        persist_user_display_kind: str | None = None,
+        persist_user_display_metadata: dict[str, Any] | None = None,
+    ) -> PromptResponse:
+        loop = asyncio.get_running_loop()
         if state.cancel_event:
             state.cancel_event.clear()
         cbs = self._wire_turn_callbacks(state, session_id, conn, loop)
@@ -860,6 +990,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
                 return self._run_agent_turn(
                     state=state, session_id=session_id, user_text=user_text, user_content=user_content, conn=conn,
                     loop=loop, approval_cb=cbs.approval_cb, edit_approval_requester=cbs.edit_approval_requester,
+                    persist_user_display_kind=persist_user_display_kind,
+                    persist_user_display_metadata=persist_user_display_metadata,
                 )
             finally:
                 # Still on the executor thread: ``_send_update`` blocks on the loop, so flushing
@@ -878,6 +1010,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
+                state.active_turn_kind = ""
             return PromptResponse(stop_reason="end_turn")
 
         return await self._finish_turn(state, session_id, conn, result, pre_turn_hermes_id, cbs.streamed)
@@ -893,10 +1026,45 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         except Exception:
             logger.debug("Could not flush open ACP tool calls for %s", session_id, exc_info=True)
 
+    def _wire_background_review_callback(
+        self,
+        state: SessionState,
+        session_id: str,
+        conn: Any,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        if conn is None:
+            state.agent.background_review_callback = None
+            return
+
+        def background_review_callback(message: str) -> None:
+            if self._conn is not conn:
+                return
+            if session_id not in self._connected_session_ids:
+                return
+
+            update = AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(
+                    type="text",
+                    text=str(message),
+                ),
+                field_meta={
+                    "hermes": {
+                        "backgroundReview": True,
+                    },
+                },
+            )
+            from acp_adapter.commands import _send_update
+            _send_update(conn, session_id, loop, update)
+
+        state.agent.background_review_callback = background_review_callback
+
     def _wire_turn_callbacks(
         self, state: SessionState, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop
     ) -> _TurnCallbacks:
         """Install the ACP streaming callbacks on the session agent for one turn."""
+        self._wire_background_review_callback(state, session_id, conn, loop)
         cbs = _TurnCallbacks()
         if conn:
             tool_call_ids: dict[str, Deque[str]] = defaultdict(deque)
@@ -956,6 +1124,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if "messages" in result and isinstance(result["messages"], list):
                 state.history = result["messages"]
                 self.session_manager.save_session(session_id)
+            self._connected_session_ids.add(session_id)
 
             # Head rotated (compression split): emit provenance so clients can render the boundary.
             post_turn_hermes_id = getattr(state.agent, "session_id", None)
@@ -972,7 +1141,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             cancelled = bool(state.cancel_event and state.cancel_event.is_set())
             # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
             from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
-
             interrupted = bool(result.get("interrupted")) or cancelled
             suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
             # Send the final text unless already streamed — or if a plugin hook transformed it after.
@@ -993,7 +1161,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             with state.runtime_lock:
                 state.is_running = False
                 state.current_prompt_text = ""
-            await self._drain_queued_prompts(state, session_id, conn)
+                state.active_turn_kind = ""
+            await self._drain_pending_work(state, session_id, conn)
 
         usage = None
         if any(result.get(k) is not None for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
@@ -1004,6 +1173,70 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             )
         await self._send_usage_update(state)
         return PromptResponse(stop_reason="cancelled" if cancelled else "end_turn", usage=usage)
+
+    async def _drain_background_completions(
+        self,
+        state: SessionState,
+        session_id: str,
+        conn: Any,
+    ) -> None:
+        if conn is None:
+            return
+
+        if self._conn is not conn:
+            return
+
+        if session_id not in self._connected_session_ids:
+            return
+
+        with state.runtime_lock:
+            if state.is_running or state.command_op or state.queued_prompts or not state.background_completions:
+                return
+
+            items = list(state.background_completions)
+            state.background_completions.clear()
+
+            state.is_running = True
+            state.current_prompt_text = "[internal background completion]"
+            state.active_turn_kind = "background"
+
+        if self._conn is not conn or session_id not in self._connected_session_ids:
+            with state.runtime_lock:
+                state.background_completions = items + state.background_completions
+                state.is_running = False
+                state.current_prompt_text = ""
+                state.active_turn_kind = ""
+            return
+
+        process_ids = [process_id for process_id, _ in items]
+        completion_text = "\n\n".join(text for _, text in items)
+
+        internal_text = f"""[Hermes internal background completion]
+
+One or more background processes started earlier in this ACP session have completed.
+
+Continue the existing task using the completion information below.
+Use the normal process tools if more output is needed.
+Do not merely acknowledge the event when further work remains.
+
+{completion_text}"""
+
+        await self._execute_claimed_turn(
+            state,
+            session_id,
+            internal_text,
+            internal_text,
+            conn,
+            persist_user_display_kind="internal_notification",
+            persist_user_display_metadata={
+                "source": "acp_background_completion",
+                "process_ids": process_ids,
+            },
+        )
+
+    async def _drain_pending_work(self, state: SessionState, session_id: str, conn: Any) -> None:
+        await self._drain_queued_prompts(state, session_id, conn)
+        await self._drain_background_completions(state, session_id, conn)
 
     async def _drain_queued_prompts(self, state: SessionState, session_id: str, conn: Any) -> None:
         """Run queued prompts while the session is idle. Reached from ``_finish_turn`` and
@@ -1068,6 +1301,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             normalized_mode = self._MODE_DEFAULT
         state.mode = normalized_mode
         self.session_manager.save_session(session_id)
+        self._connected_session_ids.add(session_id)
         logger.info("Session %s: mode switched to %s", session_id, normalized_mode)
         return SetSessionModeResponse()
 
@@ -1089,5 +1323,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             options[str(config_id)] = value
             state.config_options = options
         self.session_manager.save_session(session_id)
+        self._connected_session_ids.add(session_id)
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
