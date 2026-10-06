@@ -576,6 +576,14 @@ class SessionManager:
 
         try:
             agent = AIAgent(**kwargs)
+            display_cfg = config.get("display") or {}
+            mem_notif = display_cfg.get("memory_notifications")
+            if isinstance(mem_notif, bool):
+                mem_notif = "on" if mem_notif else "off"
+            mem_notif = str(mem_notif).lower() if mem_notif else "on"
+            if mem_notif not in {"off", "on", "verbose"}:
+                mem_notif = "on"
+            agent.memory_notifications = mem_notif
         except Exception as exc:
             # The bare-AIAgent fallback dies with "No LLM provider configured. Run `hermes setup`" on a
             # machine that is configured and was working a call earlier; the swallowed resolution

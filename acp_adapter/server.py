@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from datetime import datetime, timezone
 import contextlib
 import contextvars
@@ -258,6 +259,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         super().__init__()
         self.session_manager = session_manager or SessionManager()
         self._conn: Optional[acp.Client] = None
+        self._connected_session_ids: set[str] = set()
+        self._background_notification_task = None
         self._connected_session_ids: set[str] = set()
         self._background_notification_task: asyncio.Task | None = None
 
@@ -728,6 +731,8 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         state = await asyncio.to_thread(self.session_manager.create_session, cwd=cwd)
         await self._attach_session_mcp(state, mcp_servers, "New session %s (cwd=%s)", state.session_id, cwd)
         self._connected_session_ids.add(state.session_id)
+        if self._conn:
+            self._schedule_soon(lambda: self._drain_background_completions(state, state.session_id, self._conn))
         return NewSessionResponse(session_id=state.session_id, **await self._session_response_fields(state))
 
     async def load_session(
@@ -754,6 +759,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         # get_session restores a not-in-memory id from the DB (full AIAgent build) and waits
         # on the restore lock — off the loop, like new/load/resume/fork (#58083).
         state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        if self._conn:
+            self._connected_session_ids.add(state.session_id)
+        self._wire_background_review_callback(state, session_id, self._conn, asyncio.get_running_loop())
         if not (state and state.cancel_event):
             return
         with state.runtime_lock:
@@ -936,6 +944,9 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
         if state is None:
             logger.error("prompt: session %s not found", session_id)
             return PromptResponse(stop_reason="refusal")
+        if self._conn:
+            self._connected_session_ids.add(state.session_id)
+        self._wire_background_review_callback(state, session_id, self._conn, asyncio.get_running_loop())
 
         user_text = _extract_text(prompt).strip()
         user_content = _content_blocks_to_openai_user_content(prompt)
@@ -1124,7 +1135,7 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             if "messages" in result and isinstance(result["messages"], list):
                 state.history = result["messages"]
                 self.session_manager.save_session(session_id)
-            self._connected_session_ids.add(session_id)
+
 
             # Head rotated (compression split): emit provenance so clients can render the boundary.
             post_turn_hermes_id = getattr(state.agent, "session_id", None)
@@ -1140,7 +1151,6 @@ class HermesACPAgent(SlashCommandsMixin, acp.Agent):
             final_response = result.get("final_response") or ""  # None on an interrupted turn
             cancelled = bool(state.cancel_event and state.cancel_event.is_set())
             # The local "waiting for model" interrupt status is metadata, not prose; stop_reason carries it.
-            from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
             interrupted = bool(result.get("interrupted")) or cancelled
             suppress = interrupted and final_response.startswith(INTERRUPT_WAITING_FOR_MODEL_PREFIX)
             # Send the final text unless already streamed — or if a plugin hook transformed it after.
@@ -1255,6 +1265,9 @@ Do not merely acknowledge the event when further work remains.
     async def set_session_model(self, model_id: str, session_id: str, **kwargs: Any) -> SetSessionModelResponse | None:
         """Switch the model for a session (called by ACP protocol)."""
         state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        if self._conn:
+            self._connected_session_ids.add(state.session_id)
+        self._wire_background_review_callback(state, session_id, self._conn, asyncio.get_running_loop())
         if state is None:
             logger.warning("Session %s: model switch requested for missing session", session_id)
             return None
@@ -1284,7 +1297,7 @@ Do not merely acknowledge the event when further work remains.
             # Drain AFTER this response is queued, never inside it: a prompt that arrived
             # mid-switch would otherwise run a whole turn before the client sees the
             # (possibly failed) switch result.
-            self._schedule_soon(lambda: self._drain_queued_prompts(state, session_id, self._conn))
+            self._schedule_soon(lambda: self._drain_pending_work(state, session_id, self._conn))
         logger.info(
             "Session %s: model switched to %s via provider %s", session_id, resolved_model, requested_provider
         )
@@ -1293,6 +1306,9 @@ Do not merely acknowledge the event when further work remains.
     async def set_session_mode(self, mode_id: str, session_id: str, **kwargs: Any) -> SetSessionModeResponse | None:
         """Persist the editor-requested mode so ACP clients do not fail on mode switches."""
         state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        if self._conn:
+            self._connected_session_ids.add(state.session_id)
+        self._wire_background_review_callback(state, session_id, self._conn, asyncio.get_running_loop())
         if state is None:
             logger.warning("Session %s: mode switch requested for missing session", session_id)
             return None
@@ -1301,15 +1317,46 @@ Do not merely acknowledge the event when further work remains.
             normalized_mode = self._MODE_DEFAULT
         state.mode = normalized_mode
         self.session_manager.save_session(session_id)
-        self._connected_session_ids.add(session_id)
+
         logger.info("Session %s: mode switched to %s", session_id, normalized_mode)
         return SetSessionModeResponse()
+
+    def _wire_background_review_callback(self, state: SessionState, session_id: str, conn: Any, loop: asyncio.AbstractEventLoop) -> None:
+        if conn is None:
+            state.agent.background_review_callback = None
+            return
+
+        def background_review_callback(message: str) -> None:
+            if self._conn is not conn:
+                return
+            if session_id not in self._connected_session_ids:
+                return
+
+            update = AgentMessageChunk(
+                session_update="agent_message_chunk",
+                content=TextContentBlock(
+                    type="text",
+                    text=str(message),
+                ),
+                field_meta={
+                    "hermes": {
+                        "backgroundReview": True,
+                    }
+                },
+            )
+            from acp_adapter.events import _send_update
+            _send_update(conn, session_id, loop, update)
+
+        state.agent.background_review_callback = background_review_callback
 
     async def set_config_option(
         self, config_id: str, session_id: str, value: str, **kwargs: Any
     ) -> SetSessionConfigOptionResponse | None:
         """Accept ACP config option updates even when Hermes has no typed ACP config surface yet."""
         state = await asyncio.to_thread(self.session_manager.get_session, session_id)
+        if self._conn:
+            self._connected_session_ids.add(state.session_id)
+        self._wire_background_review_callback(state, session_id, self._conn, asyncio.get_running_loop())
         if state is None:
             logger.warning("Session %s: config update requested for missing session", session_id)
             return None
@@ -1323,6 +1370,6 @@ Do not merely acknowledge the event when further work remains.
             options[str(config_id)] = value
             state.config_options = options
         self.session_manager.save_session(session_id)
-        self._connected_session_ids.add(session_id)
+
         logger.info("Session %s: config option %s updated", session_id, config_id)
         return SetSessionConfigOptionResponse(config_options=[])
