@@ -40,12 +40,32 @@ def _key_scope(key: ServerKey) -> Optional[str]:
     return key[0] if isinstance(key, tuple) else None
 
 
+def _is_session_scope(scope: Optional[str]) -> bool:
+    if scope is None:
+        return False
+    from tools.registry import current_session_tool_scope
+    return scope == current_session_tool_scope() or (isinstance(scope, str) and scope.startswith("editor-session:"))
+
+
+def _parent_profile_scope() -> Optional[str]:
+    from agent.secret_scope import serves_routed_profile
+    if not serves_routed_profile():
+        return None
+    from tools.registry import registry
+    return registry.current_scope_key()
+
+
 def _key_visible_in_scope(key: ServerKey, scope: Optional[str]) -> bool:
     """Whether the connection under *key* serves *scope*: owned by it or adopted into it.
     Caller holds ``_core._lock`` or tolerates a racy read (status surfaces)."""
     if scope is None:
         return True
-    return _key_scope(key) == scope or scope in _core._server_tool_scopes.get(key, ())
+    if _key_scope(key) == scope or scope in _core._server_tool_scopes.get(key, ()):
+        return True
+    if _is_session_scope(scope):
+        parent = _parent_profile_scope()
+        return _key_scope(key) == parent or (parent in _core._server_tool_scopes.get(key, ()) if parent is not None else False)
+    return False
 
 
 def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool = True) -> ServerKey:
@@ -60,8 +80,15 @@ def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool
     for key, scopes in _core._server_tool_scopes.items():
         if scope in scopes and _key_name(key) == name and key in _core._servers:
             return key
+    if _is_session_scope(scope):
+        parent = _parent_profile_scope()
+        parent_own = _server_key(name, parent, current=False)
+        if parent_own in _core._servers or parent_own in _core._lazy_server_configs:
+            return parent_own
+        for key, scopes in _core._server_tool_scopes.items():
+            if parent in scopes and _key_name(key) == name and key in _core._servers:
+                return key
     return own
-
 
 # Ledgers keyed by connection key (``tools.mcp_tool``).
 _KEYED_LEDGERS = (

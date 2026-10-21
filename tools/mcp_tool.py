@@ -725,9 +725,15 @@ def _server_visible_in_scope(key, scope: Optional[str]) -> bool:
     teardown owner."""
     if scope is None:
         return True
-    return (_server_scope_keys.get(key) == scope
-            or scope in _server_tool_scopes.get(key, ()))
-
+    if (_server_scope_keys.get(key) == scope
+            or scope in _server_tool_scopes.get(key, ())):
+        return True
+    from tools.mcp_tool_scope import _is_session_scope, _parent_profile_scope
+    if _is_session_scope(scope):
+        parent = _parent_profile_scope()
+        return (_server_scope_keys.get(key) == parent
+                or (parent in _server_tool_scopes.get(key, ()) if parent is not None else False))
+    return False
 
 # Cross-process discovery guard: advisory file lock so gateway + CLI + TUI don't all discover.
 # See issue #62771.
