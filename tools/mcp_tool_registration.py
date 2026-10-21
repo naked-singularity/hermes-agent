@@ -19,7 +19,7 @@ from tools.mcp_tool_handlers import (
     _make_list_resources_handler, _make_read_resource_handler)
 from tools.mcp_tool_schema import (
     _UTILITY_CAPABILITY_ATTRS, _build_utility_schemas, _normalize_name_filter, matches_name_filter)
-from tools.mcp_tool_scope import _key_name, _key_scope, _resolve_server_key, _server_key
+from tools.mcp_tool_scope import _is_session_scope, _key_name, _key_scope, _resolve_server_key, _server_key
 
 if TYPE_CHECKING:  # pragma: no cover
     from tools.mcp_tool import MCPServerTask
@@ -524,7 +524,7 @@ def _same_server_route(server: Any, config: dict, *, cross_profile: bool = False
 def register_connected_into_current_scope(servers: dict) -> int:
     """Serialize shared-scope reconciliation and registration for one discovery pass."""
     scope = _core._mcp_registry_scope()
-    if scope is None:
+    if scope is None or _is_session_scope(scope):
         return 0
     with _SCOPE_REFRESH_LOCKS[hash(scope) % len(_SCOPE_REFRESH_LOCKS)]:
         return _register_connected_into_current_scope(servers)

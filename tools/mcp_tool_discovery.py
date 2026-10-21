@@ -366,7 +366,7 @@ def _select_new_servers(servers: dict[str, dict]) -> dict[str, dict]:
         # This scope's own connections OR shared ones it adopted (``register_connected_into_current_scope``
         # ran first): a same-named server owned by ANOTHER profile with other credentials is not
         # "connected" for us and must be a candidate, or this profile ends up silently tool-less.
-        keys = {k: _resolve_server_key(k, current_scope, current=False) for k in servers}
+        keys = {k: _resolve_server_key(k, current_scope, current=False, fallback=False) for k in servers}
         # Only attempt servers that aren't already connected (or currently connecting) and are enabled.
         # Checking ``_server_connecting`` prevents duplicate subprocess spawns when ``discover_mcp_tools()``
         # is called from multiple entry-points before the first batch finishes (#58862).
@@ -635,7 +635,7 @@ def discover_mcp_tools(allowed_mcp_names: Optional[list[str]] = None) -> list[st
     cookie = _acquire_discovery_lock_with_retry()
     try:
         with _core._lock:
-            keys = {name: _resolve_server_key(name) for name in servers}
+            keys = {name: _resolve_server_key(name, fallback=False) for name in servers}
             new_server_names = [name for name, cfg in servers.items()
                                 if keys[name] not in _core._servers and keys[name] not in _core._server_connecting
                                 and mcp_server_enabled(cfg)]
@@ -698,7 +698,7 @@ def _unregistered(wanted: set[str], scope) -> set[str]:
         # case, so a multiplexed profile would re-enter discovery (cross-process lock) and log
         # "added" every tick forever for a server that is already serving it.
         known = {name for name in wanted
-                 if (key := _resolve_server_key(name, scope, current=False)) in _core._servers
+                 if (key := _resolve_server_key(name, scope, current=False, fallback=False)) in _core._servers
                  or key in _core._server_connecting or key in _core._lazy_server_configs}
     return wanted - known
 
@@ -778,7 +778,7 @@ def restart_mcp_servers_with_new_inputs(names: set[str]) -> list[str]:
             for name in sorted(names):
                 config = servers.get(name)
                 with _core._lock:
-                    key = _resolve_server_key(name, scope, current=False)
+                    key = _resolve_server_key(name, scope, current=False, fallback=False)
                     server = _core._servers.get(key)
                 recorded = getattr(server, "_resolved_identity", None)
                 if config is None or recorded is None or not mcp_server_enabled(config):

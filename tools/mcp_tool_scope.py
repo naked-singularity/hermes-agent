@@ -68,7 +68,13 @@ def _key_visible_in_scope(key: ServerKey, scope: Optional[str]) -> bool:
     return False
 
 
-def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool = True) -> ServerKey:
+def _resolve_server_key(
+    name: str,
+    scope: Optional[str] = None,
+    *,
+    current: bool = True,
+    fallback: bool = True,
+) -> ServerKey:
     """The connection key a call to *name* from *scope* must use: the scope's own connection
     (live, connecting or lazily registered) when it has one, else a shared connection it
     adopted, else its own (not yet existing) key so bookkeeping lands under this scope."""
@@ -77,10 +83,12 @@ def _resolve_server_key(name: str, scope: Optional[str] = None, *, current: bool
     own = _server_key(name, scope, current=False)
     if scope is None or own in _core._servers or own in _core._lazy_server_configs:
         return own
+    if own in _core._server_connecting or own in _core._server_connect_errors:
+        return own
     for key, scopes in _core._server_tool_scopes.items():
         if scope in scopes and _key_name(key) == name and key in _core._servers:
             return key
-    if _is_session_scope(scope):
+    if fallback and _is_session_scope(scope):
         parent = _parent_profile_scope()
         parent_own = _server_key(name, parent, current=False)
         if parent_own in _core._servers or parent_own in _core._lazy_server_configs:
